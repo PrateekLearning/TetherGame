@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TETHER — momentum arena</title>
+<style>
+  :root{
+    --void:   #17131f;
+    --field:  #201a2b;
+    --line:   #322a42;
+    --tether: #7de2c3;
+    --threat: #ff5d73;
+    --ink:    #efe9f5;
+    --muted:  #8b7fa0;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  *{ box-sizing:border-box; margin:0; padding:0; }
+
+  html,body{ height:100%; overflow:hidden; background:var(--void); }
+
+  body{
+    display:grid; place-items:center;
+    font-family:var(--mono);
+    color:var(--ink);
+    -webkit-font-smoothing:antialiased;
+    touch-action:none;
+  }
+
+  #frame{ position:relative; width:100vw; height:100vh; }
+  #stage{ display:block; width:100%; height:100%; }
+
+  /* ---- telemetry HUD ---- */
+  #hud{
+    position:absolute; inset:0;
+    pointer-events:none;
+    padding:clamp(14px,2.4vmin,26px);
+    display:flex; justify-content:space-between; align-items:flex-start;
+    font-size:clamp(10px,1.35vmin,13px);
+    letter-spacing:.16em; text-transform:uppercase;
+  }
+  .readout{ display:flex; flex-direction:column; gap:.35em; }
+  .readout.right{ text-align:right; }
+  .label{ color:var(--muted); font-size:.82em; }
+  .value{ font-size:2.1em; line-height:1; font-variant-numeric:tabular-nums; letter-spacing:.02em; }
+  .value.dim{ color:var(--muted); font-size:1.15em; }
+  #combo{ color:var(--tether); opacity:0; transition:opacity .18s; }
+  #combo.on{ opacity:1; }
+
+  /* ---- overlay ---- */
+  #overlay{
+    position:absolute; inset:0;
+    display:grid; place-items:center;
+    background:color-mix(in srgb, var(--void) 88%, transparent);
+    backdrop-filter:blur(3px);
+    transition:opacity .28s;
+  }
+  #overlay[hidden]{ display:none; }
+
+  .panel{ text-align:center; max-width:min(92vw,440px); padding:0 20px; }
+  .title{
+    font-size:clamp(38px,9vmin,74px);
+    letter-spacing:.34em; text-indent:.34em;
+    font-weight:400; line-height:1;
+  }
+  .rule{ height:1px; background:var(--line); margin:1.6em 0 1.4em; }
+  .blurb{
+    color:var(--muted); font-size:clamp(11px,1.6vmin,13px);
+    line-height:2; letter-spacing:.1em; text-transform:uppercase;
+  }
+  .blurb b{ color:var(--ink); font-weight:400; }
+  .blurb .cut{ color:var(--tether); font-weight:400; }
+  .blurb .hit{ color:var(--threat); font-weight:400; }
+
+  .final{ margin:.4em 0 0; }
+  .final .n{ font-size:clamp(44px,11vmin,84px); line-height:1; font-variant-numeric:tabular-nums; }
+
+  button{
+    margin-top:2.2em; padding:1em 2.4em;
+    font:inherit; font-size:clamp(11px,1.5vmin,13px);
+    letter-spacing:.24em; text-transform:uppercase;
+    color:var(--void); background:var(--tether);
+    border:0; border-radius:2px; cursor:pointer;
+    transition:transform .14s, box-shadow .14s;
+  }
+  button:hover{ transform:translateY(-1px); box-shadow:0 6px 22px -8px var(--tether); }
+  button:focus-visible{ outline:2px solid var(--ink); outline-offset:4px; }
+
+  .hint{ margin-top:1.4em; color:var(--muted); font-size:.72em; letter-spacing:.18em; }
+
+  @media (prefers-reduced-motion:reduce){
+    button, #overlay{ transition:none; }
+  }
+</style>
+</head>
+<body>
+
+<div id="frame">
+  <canvas id="stage"></canvas>
+
+  <div id="hud">
+    <div class="readout">
+      <span class="label">Score</span>
+      <span class="value" id="score">0</span>
+      <span class="value dim" id="combo">&times;1</span>
+    </div>
+    <div class="readout right">
+      <span class="label">Best</span>
+      <span class="value dim" id="best">0</span>
+    </div>
+  </div>
+
+  <div id="overlay">
+    <div class="panel" id="panel"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================================
+   TETHER — a momentum arena
+   ----------------------------------------------------------------------------
+   You are the small orb. A weighted rope hangs off you. The rope only cuts
+   when it is MOVING FAST, so you have to swing it — running in a straight
+   line kills nothing and gets you killed.
+
+   No engine, no libraries. Everything below is yours to rip apart.
+
+   Layout:
+     CONFIG      every tunable number, in one place
+     math        tiny helpers
+     Rope        verlet-integrated rope, the whole point of the game
+     Player      acceleration + exponential drag
+     Enemy       data-driven behaviours
+     Particles   fixed-size pool, no allocation during play
+     Game        fixed-timestep loop + state machine
+   ========================================================================== */
+
+const CONFIG = {
+  step: 1 / 120,            // physics tick (seconds). Fixed. Render is decoupled.
+  maxFrame: 0.25,           // clamp: stops the spiral of death after a tab-switch
+
+  arena:  { pad: 26, radius: 10 },
+
+  player: {
+    radius: 9,
+    accel: 3400,            // px/s^2
+    drag: 6,                // exponential; terminal speed = accel / drag
+  },
+
+  rope: {
+    points: 14,
+    length: 136,            // total reach in px
+    gravity: 820,
+    damping: 0.994,         // velocity retained per tick
+    iterations: 9,          // constraint relaxation passes
+    headMass: 0.30,         // lower = heavier tip = more punch
+    cutSpeed: 4.6,          // px per tick before a segment turns lethal
+    headRadius: 9,
+  },
+
+  enemy: {
+    radius: 12,
+    speed: 58,              // starting seek speed
+    speedRamp: 1.9,         // px/s added per kill
+    speedCap: 190,
+    spawnEvery: 1.5,        // seconds
+    spawnFloor: 0.36,
+    spawnDecay: 0.962,      // multiplied into the interval each spawn
+    arriveTime: 0.7,        // fade-in window; harmless while arriving
+    orbiterAfter: 8,        // score at which the second behaviour unlocks
+  },
+
+  combo:  { window: 1.7 },
+  fx:     { pool: 300, shakeDecay: 7 },
+};
+
+/* ---------------------------------------------------------------- math ---- */
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rand  = (a, b) => a + Math.random() * (b - a);
+const TAU   = Math.PI * 2;
+
+/** Shortest distance from point P to segment AB. Used for every rope hit. */
+function distToSegment(px, py, ax, ay, bx, by){
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  const t = len2 === 0 ? 0 : clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1);
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+/* ---------------------------------------------------------------- rope ---- */
+/**
+ * Verlet rope. Each point stores its previous position instead of a velocity,
+ * so velocity is implicit: v = (x - px). That makes the length constraints
+ * trivial — move a point and its velocity updates itself.
+ */
+class Rope {
+  constructor(anchorX, anchorY){
+    const { points, length, headMass } = CONFIG.rope;
+    this.rest = length / (points - 1);
+    this.pts = [];
+    for (let i = 0; i < points; i++){
+      this.pts.push({
+        x: anchorX, y: anchorY + i * this.rest,
+        px: anchorX, py: anchorY + i * this.rest,
+        // invMass 0 = immovable. Point 0 is pinned to the player.
+        inv: i === 0 ? 0 : (i === points - 1 ? headMass : 1),
+      });
+    }
+    this.head = this.pts[points - 1];
+  }
+
+  step(dt, anchorX, anchorY, bounds){
+    const { gravity, damping, iterations } = CONFIG.rope;
+    const g = gravity * dt * dt;
+
+    // 1. integrate
+    for (let i = 1; i < this.pts.length; i++){
+      const p = this.pts[i];
+      const vx = (p.x - p.px) * damping;
+      const vy = (p.y - p.py) * damping;
+      p.px = p.x; p.py = p.y;
+      p.x += vx;
+      p.y += vy + g;
+    }
+
+    // 2. relax constraints (more passes = stiffer rope)
+    for (let k = 0; k < iterations; k++){
+      this.pts[0].x = anchorX;
+      this.pts[0].y = anchorY;
+
+      for (let i = 0; i < this.pts.length - 1; i++){
+        const a = this.pts[i], b = this.pts[i + 1];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.hypot(dx, dy) || 0.0001;
+        const total = a.inv + b.inv;
+        if (total === 0) continue;
+        const push = (d - this.rest) / d;
+        a.x += dx * push * (a.inv / total);
+        a.y += dy * push * (a.inv / total);
+        b.x -= dx * push * (b.inv / total);
+        b.y -= dy * push * (b.inv / total);
+      }
+
+      // keep the tip inside the arena so it can't be parked off-screen
+      const h = this.head, r = CONFIG.rope.headRadius;
+      h.x = clamp(h.x, bounds.x + r, bounds.x + bounds.w - r);
+      h.y = clamp(h.y, bounds.y + r, bounds.y + bounds.h - r);
+    }
+  }
+
+  /** Per-tick travel of a segment's midpoint — this is what makes it lethal. */
+  segmentSpeed(i){
+    const a = this.pts[i], b = this.pts[i + 1];
+    return Math.hypot(((a.x - a.px) + (b.x - b.px)) * 0.5,
+                      ((a.y - a.py) + (b.y - b.py)) * 0.5);
+  }
+
+  /** Returns true if any fast-moving segment overlaps the circle. */
+  cuts(cx, cy, r){
+    for (let i = 0; i < this.pts.length - 1; i++){
+      if (this.segmentSpeed(i) < CONFIG.rope.cutSpeed) continue;
+      const a = this.pts[i], b = this.pts[i + 1];
+      const pad = i === this.pts.length - 2 ? CONFIG.rope.headRadius : 3;
+      if (distToSegment(cx, cy, a.x, a.y, b.x, b.y) < r + pad) return true;
+    }
+    return false;
+  }
+}
+
+/* -------------------------------------------------------------- player ---- */
+class Player {
+  constructor(x, y){ this.x = x; this.y = y; this.vx = 0; this.vy = 0; }
+
+  step(dt, input, bounds){
+    const { accel, drag, radius } = CONFIG.player;
+    let ax = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    let ay = (input.down  ? 1 : 0) - (input.up   ? 1 : 0);
+
+    // normalise so diagonals aren't faster
+    const m = Math.hypot(ax, ay);
+    if (m > 0){ ax = ax / m * accel; ay = ay / m * accel; }
+
+    this.vx += ax * dt;
+    this.vy += ay * dt;
+
+    const decay = Math.exp(-drag * dt);
+    this.vx *= decay;
+    this.vy *= decay;
+
+    this.x = clamp(this.x + this.vx * dt, bounds.x + radius, bounds.x + bounds.w - radius);
+    this.y = clamp(this.y + this.vy * dt, bounds.y + radius, bounds.y + bounds.h - radius);
+  }
+}
+
+/* --------------------------------------------------------------- enemy ---- */
+/**
+ * One class, two behaviours, picked by string. Add a case, get a new enemy —
+ * that's the extension point.
+ */
+class Enemy {
+  constructor(x, y, speed, kind){
+    this.x = x; this.y = y;
+    this.speed = speed;
+    this.kind = kind;
+    this.age = 0;
+    this.phase = rand(0, TAU);
+    this.dead = false;
+  }
+
+  get arriving(){ return this.age < CONFIG.enemy.arriveTime; }
+
+  step(dt, target){
+    this.age += dt;
+    const dx = target.x - this.x, dy = target.y - this.y;
+    const d = Math.hypot(dx, dy) || 1;
+    let nx = dx / d, ny = dy / d;
+
+    if (this.kind === 'orbiter'){
+      // bias sideways when close, so it circles instead of charging
+      this.phase += dt * 2.4;
+      const swirl = clamp(180 / d, 0, 1) * Math.sin(this.phase);
+      const tx = -ny, ty = nx;
+      nx += tx * swirl; ny += ty * swirl;
+      const n = Math.hypot(nx, ny) || 1;
+      nx /= n; ny /= n;
+    }
+
+    this.x += nx * this.speed * dt;
+    this.y += ny * this.speed * dt;
+  }
+}
+
+/* ----------------------------------------------------------- particles ---- */
+/** Fixed pool. Never allocates mid-game, so no GC hitches. */
+class Particles {
+  constructor(n){
+    this.pool = Array.from({ length: n }, () => ({
+      x:0, y:0, vx:0, vy:0, life:0, max:1, size:2, hue:'',
+    }));
+    this.cursor = 0;
+  }
+
+  burst(x, y, count, color, power = 1){
+    for (let i = 0; i < count; i++){
+      const p = this.pool[this.cursor];
+      this.cursor = (this.cursor + 1) % this.pool.length;
+      const a = rand(0, TAU), s = rand(40, 260) * power;
+      p.x = x; p.y = y;
+      p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+      p.max = p.life = rand(0.25, 0.6);
+      p.size = rand(1, 2.8);
+      p.hue = color;
+    }
+  }
+
+  step(dt){
+    for (const p of this.pool){
+      if (p.life <= 0) continue;
+      p.life -= dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      const decay = Math.exp(-3.2 * dt);
+      p.vx *= decay; p.vy *= decay;
+    }
+  }
+
+  draw(ctx){
+    for (const p of this.pool){
+      if (p.life <= 0) continue;
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.hue;
+      ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ---------------------------------------------------------------- game ---- */
+const STATE = { MENU: 'menu', PLAY: 'play', OVER: 'over' };
+
+class Game {
+  constructor(canvas){
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.dpr = 1;
+    this.bounds = { x:0, y:0, w:0, h:0 };
+
+    this.input = { left:false, right:false, up:false, down:false };
+    this.particles = new Particles(CONFIG.fx.pool);
+    this.reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // Best score lives in memory only. Running this locally? swap in
+    // localStorage here — it just doesn't work inside a sandboxed preview.
+    this.best = 0;
+
+    this.state = STATE.MENU;
+    this.accumulator = 0;
+    this.last = performance.now();
+
+    this.bindEvents();
+    this.resize();
+    this.showMenu();
+    requestAnimationFrame(this.frame);
+  }
+
+  /* -- setup ------------------------------------------------------------- */
+  bindEvents(){
+    const keymap = {
+      ArrowLeft:'left', KeyA:'left', ArrowRight:'right', KeyD:'right',
+      ArrowUp:'up', KeyW:'up', ArrowDown:'down', KeyS:'down',
+    };
+    addEventListener('keydown', e => {
+      if (keymap[e.code]){ this.input[keymap[e.code]] = true; e.preventDefault(); }
+      if ((e.code === 'Space' || e.code === 'Enter') && this.state !== STATE.PLAY){
+        e.preventDefault(); this.start();
+      }
+    });
+    addEventListener('keyup', e => {
+      if (keymap[e.code]){ this.input[keymap[e.code]] = false; e.preventDefault(); }
+    });
+    addEventListener('blur', () => {
+      for (const k in this.input) this.input[k] = false;
+    });
+    addEventListener('resize', () => this.resize());
+  }
+
+  resize(){
+    this.dpr = Math.min(devicePixelRatio || 1, 2);
+    const w = innerWidth, h = innerHeight;
+    this.canvas.width  = Math.floor(w * this.dpr);
+    this.canvas.height = Math.floor(h * this.dpr);
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+
+    const pad = CONFIG.arena.pad;
+    this.bounds = { x: pad, y: pad, w: w - pad * 2, h: h - pad * 2 };
+  }
+
+  /* -- lifecycle --------------------------------------------------------- */
+  start(){
+    const cx = this.bounds.x + this.bounds.w / 2;
+    const cy = this.bounds.y + this.bounds.h / 2;
+
+    this.player  = new Player(cx, cy);
+    this.rope    = new Rope(cx, cy);
+    this.enemies = [];
+
+    this.score = 0;
+    this.combo = 1;
+    this.comboTimer = 0;
+    this.spawnInterval = CONFIG.enemy.spawnEvery;
+    this.spawnTimer = 0.9;
+    this.shake = 0;
+    this.elapsed = 0;
+
+    this.state = STATE.PLAY;
+    overlay.hidden = true;
+    this.syncHud();
+  }
+
+  gameOver(){
+    this.state = STATE.OVER;
+    this.best = Math.max(this.best, this.score);
+    this.particles.burst(this.player.x, this.player.y, 70, getVar('--threat'), 1.7);
+    if (!this.reduceMotion) this.shake = 22;
+    this.syncHud();
+
+    panel.innerHTML = `
+      <span class="label" style="color:var(--muted);letter-spacing:.24em">Tether severed</span>
+      <div class="final"><span class="n">${this.score}</span></div>
+      <div class="rule"></div>
+      <p class="blurb">Best this session &mdash; <b>${this.best}</b></p>
+      <button id="go">Run it back</button>
+      <p class="hint">or press space</p>`;
+    overlay.hidden = false;
+    panel.querySelector('#go').onclick = () => this.start();
+    panel.querySelector('#go').focus();
+  }
+
+  showMenu(){
+    panel.innerHTML = `
+      <h1 class="title">Tether</h1>
+      <div class="rule"></div>
+      <p class="blurb">
+        <b>WASD</b> or <b>arrows</b> to move<br>
+        The rope only <span class="cut">cuts while it swings</span><br>
+        Standing still gets you <span class="hit">killed</span>
+      </p>
+      <button id="go">Begin</button>
+      <p class="hint">or press space</p>`;
+    overlay.hidden = false;
+    panel.querySelector('#go').onclick = () => this.start();
+  }
+
+  /* -- simulation -------------------------------------------------------- */
+  spawn(){
+    const b = this.bounds;
+    const edge = Math.floor(rand(0, 4));
+    const m = 40;
+    let x, y;
+    if (edge === 0){ x = rand(b.x, b.x + b.w); y = b.y - m; }
+    else if (edge === 1){ x = b.x + b.w + m; y = rand(b.y, b.y + b.h); }
+    else if (edge === 2){ x = rand(b.x, b.x + b.w); y = b.y + b.h + m; }
+    else { x = b.x - m; y = rand(b.y, b.y + b.h); }
+
+    const speed = Math.min(
+      CONFIG.enemy.speed + this.score * CONFIG.enemy.speedRamp,
+      CONFIG.enemy.speedCap
+    );
+    const kind = this.score >= CONFIG.enemy.orbiterAfter && Math.random() < 0.35
+      ? 'orbiter' : 'seeker';
+
+    this.enemies.push(new Enemy(x, y, speed, kind));
+  }
+
+  tick(dt){
+    this.elapsed += dt;
+
+    this.player.step(dt, this.input, this.bounds);
+    this.rope.step(dt, this.player.x, this.player.y, this.bounds);
+
+    // spawning
+    this.spawnTimer -= dt;
+    if (this.spawnTimer <= 0){
+      this.spawn();
+      this.spawnInterval = Math.max(
+        CONFIG.enemy.spawnFloor,
+        this.spawnInterval * CONFIG.enemy.spawnDecay
+      );
+      this.spawnTimer = this.spawnInterval;
+    }
+
+    // combo decay
+    if (this.comboTimer > 0){
+      this.comboTimer -= dt;
+      if (this.comboTimer <= 0) this.combo = 1;
+    }
+
+    const r = CONFIG.enemy.radius;
+    for (const e of this.enemies){
+      e.step(dt, this.player);
+      if (e.arriving) continue;
+
+      if (this.rope.cuts(e.x, e.y, r)){
+        e.dead = true;
+        this.score += this.combo;
+        this.combo = Math.min(this.combo + 1, 9);
+        this.comboTimer = CONFIG.combo.window;
+        this.particles.burst(e.x, e.y, 16, getVar('--tether'));
+        if (!this.reduceMotion) this.shake = Math.min(this.shake + 5, 14);
+        this.syncHud();
+        continue;
+      }
+
+      if (Math.hypot(e.x - this.player.x, e.y - this.player.y) < r + CONFIG.player.radius){
+        this.gameOver();
+        return;
+      }
+    }
+
+    // compact in place — cheaper than filter(), no garbage
+    let w = 0;
+    for (let i = 0; i < this.enemies.length; i++){
+      if (!this.enemies[i].dead) this.enemies[w++] = this.enemies[i];
+    }
+    this.enemies.length = w;
+
+    this.particles.step(dt);
+    this.shake *= Math.exp(-CONFIG.fx.shakeDecay * dt);
+  }
+
+  syncHud(){
+    scoreEl.textContent = this.score ?? 0;
+    bestEl.textContent  = this.best;
+    comboEl.textContent = '×' + (this.combo ?? 1);
+    comboEl.classList.toggle('on', (this.combo ?? 1) > 1);
+  }
+
+  /* -- rendering --------------------------------------------------------- */
+  draw(){
+    const ctx = this.ctx, b = this.bounds;
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+
+    ctx.save();
+    if (this.shake > 0.2){
+      ctx.translate(rand(-this.shake, this.shake), rand(-this.shake, this.shake));
+    }
+
+    this.drawArena(ctx, b);
+    if (this.state !== STATE.MENU && this.player){
+      this.drawEnemies(ctx);
+      this.drawRope(ctx);
+      this.drawPlayer(ctx);
+    }
+    this.particles.draw(ctx);
+
+    ctx.restore();
+  }
+
+  drawArena(ctx, b){
+    ctx.fillStyle = getVar('--field');
+    roundRect(ctx, b.x, b.y, b.w, b.h, CONFIG.arena.radius);
+    ctx.fill();
+
+    // dot grid — reads as a measured field, not decoration
+    ctx.fillStyle = getVar('--line');
+    const gap = 46;
+    for (let x = b.x + gap; x < b.x + b.w; x += gap){
+      for (let y = b.y + gap; y < b.y + b.h; y += gap){
+        ctx.fillRect(x - 1, y - 1, 2, 2);
+      }
+    }
+
+    ctx.strokeStyle = getVar('--line');
+    ctx.lineWidth = 1;
+    roundRect(ctx, b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1, CONFIG.arena.radius);
+    ctx.stroke();
+  }
+
+  drawEnemies(ctx){
+    const r = CONFIG.enemy.radius;
+    for (const e of this.enemies){
+      const t = clamp(e.age / CONFIG.enemy.arriveTime, 0, 1);
+      ctx.globalAlpha = 0.25 + t * 0.75;
+      ctx.strokeStyle = getVar('--threat');
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, r * (0.6 + t * 0.4), 0, TAU);
+      ctx.stroke();
+
+      if (t >= 1){
+        ctx.fillStyle = getVar('--threat');
+        ctx.globalAlpha = e.kind === 'orbiter' ? 0.85 : 0.45;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, r * 0.36, 0, TAU);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  drawRope(ctx){
+    const pts = this.rope.pts;
+    ctx.lineCap = 'round';
+
+    for (let i = 0; i < pts.length - 1; i++){
+      // speed drives brightness: the player can *see* when the rope is lethal
+      const heat = clamp(this.rope.segmentSpeed(i) / CONFIG.rope.cutSpeed, 0, 1.6);
+      const a = pts[i], b = pts[i + 1];
+      ctx.globalAlpha = 0.2 + heat * 0.75;
+      ctx.lineWidth = 1.4 + heat * 2.4;
+      ctx.strokeStyle = heat >= 1 ? getVar('--tether') : getVar('--muted');
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    const h = this.rope.head;
+    const hot = this.rope.segmentSpeed(pts.length - 2) >= CONFIG.rope.cutSpeed;
+    ctx.fillStyle = hot ? getVar('--tether') : getVar('--muted');
+    ctx.beginPath();
+    ctx.arc(h.x, h.y, CONFIG.rope.headRadius, 0, TAU);
+    ctx.fill();
+  }
+
+  drawPlayer(ctx){
+    const p = this.player;
+    ctx.fillStyle = getVar('--ink');
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, CONFIG.player.radius, 0, TAU);
+    ctx.fill();
+  }
+
+  /* -- the loop ---------------------------------------------------------- */
+  frame = (now) => {
+    let delta = (now - this.last) / 1000;
+    this.last = now;
+    if (delta > CONFIG.maxFrame) delta = CONFIG.maxFrame;
+
+    if (this.state === STATE.PLAY){
+      this.accumulator += delta;
+      while (this.accumulator >= CONFIG.step){
+        this.tick(CONFIG.step);
+        this.accumulator -= CONFIG.step;
+        if (this.state !== STATE.PLAY) break;
+      }
+    } else {
+      this.particles.step(delta);
+      this.shake *= Math.exp(-CONFIG.fx.shakeDecay * delta);
+    }
+
+    this.draw();
+    requestAnimationFrame(this.frame);
+  };
+}
+
+/* -------------------------------------------------------------- helpers --- */
+const cssVars = getComputedStyle(document.documentElement);
+const varCache = {};
+function getVar(name){
+  return varCache[name] ?? (varCache[name] = cssVars.getPropertyValue(name).trim());
+}
+
+function roundRect(ctx, x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/* ------------------------------------------------------------------ go ---- */
+const overlay = document.getElementById('overlay');
+const panel   = document.getElementById('panel');
+const scoreEl = document.getElementById('score');
+const bestEl  = document.getElementById('best');
+const comboEl = document.getElementById('combo');
+
+new Game(document.getElementById('stage'));
+</script>
+</body>
+</html>
